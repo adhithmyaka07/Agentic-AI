@@ -2,7 +2,7 @@ import os
 import json
 import requests
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from langserve import add_routes
@@ -12,21 +12,24 @@ from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
 
+# Import the LangGraph workflow from the other file
 from langgraph_app import run_langgraph
 
 
 # ============================================================
-# API KEY
+# 1. GEMINI API KEY
 # ============================================================
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured.")
+if not GOOGLE_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY environment variable is not configured."
+    )
 
 
 # ============================================================
-# LANGCHAIN TOOLS
+# 2. LANGCHAIN TOOLS
 # ============================================================
 
 @tool
@@ -35,74 +38,118 @@ def search_movies(genre: str) -> str:
 
     movies = {
         "sci-fi": "Cargo, 2.0, Mr. India",
+        "science fiction": "Cargo, 2.0, Mr. India",
         "comedy": "3 Idiots, Hera Pheri, Munna Bhai M.B.B.S.",
-        "action": "RRR, Vikram, Baahubali"
+        "action": "RRR, Vikram, Baahubali",
+        "romance": "Jab We Met, Veer-Zaara, Dilwale Dulhania Le Jayenge",
+        "thriller": "Andhadhun, Drishyam, Kahaani"
     }
 
     return movies.get(
-        genre.lower(),
+        genre.lower().strip(),
         "No movies found for that genre."
     )
 
 
 @tool
 def change_to_f(temp_c: float) -> float:
-    """Convert Celsius to Fahrenheit."""
+    """Convert Celsius temperature to Fahrenheit."""
 
-    return temp_c * 1.8 + 32
+    return round(temp_c * 1.8 + 32, 2)
 
 
 @tool
 def get_weather(city: str) -> str:
-    """Get current weather for a city."""
+    """Get current weather for an Indian city."""
 
-    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+    try:
 
-    geo_response = requests.get(
-        geo_url,
-        params={
+        # ----------------------------------------------------
+        # Geocoding
+        # ----------------------------------------------------
+
+        geo_url = (
+            "https://geocoding-api.open-meteo.com/v1/search"
+        )
+
+        geo_params = {
             "name": city,
             "count": 1,
             "language": "en",
             "format": "json"
-        },
-        timeout=10
-    )
+        }
 
-    geo_response.raise_for_status()
+        geo_response = requests.get(
+            geo_url,
+            params=geo_params,
+            timeout=10
+        )
 
-    data = geo_response.json()
+        geo_response.raise_for_status()
 
-    if "results" not in data:
-        return f"Could not find city: {city}"
+        geo_data = geo_response.json()
 
-    location = data["results"][0]
+        if (
+            "results" not in geo_data
+            or not geo_data["results"]
+        ):
+            return (
+                f"Could not find weather data "
+                f"for city: {city}"
+            )
 
-    weather_response = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
+        location = geo_data["results"][0]
+
+        latitude = location["latitude"]
+        longitude = location["longitude"]
+
+        # ----------------------------------------------------
+        # Weather
+        # ----------------------------------------------------
+
+        weather_url = (
+            "https://api.open-meteo.com/v1/forecast"
+        )
+
+        weather_params = {
+            "latitude": latitude,
+            "longitude": longitude,
             "current": "temperature_2m,weather_code",
             "temperature_unit": "celsius"
-        },
-        timeout=10
-    )
+        }
 
-    weather_response.raise_for_status()
+        weather_response = requests.get(
+            weather_url,
+            params=weather_params,
+            timeout=10
+        )
 
-    current = weather_response.json()["current"]
+        weather_response.raise_for_status()
 
-    return json.dumps({
-        "city": location["name"],
-        "country": location.get("country"),
-        "temperature_celsius": current["temperature_2m"],
-        "weather_code": current["weather_code"]
-    })
+        weather_data = weather_response.json()
+
+        current = weather_data["current"]
+
+        result = {
+            "resolved_city": location["name"],
+            "country": location.get("country"),
+            "temperature_celsius": current["temperature_2m"],
+            "weather_code": current["weather_code"]
+        }
+
+        return json.dumps(result)
+
+    except requests.RequestException as e:
+
+        return f"Weather API error: {str(e)}"
+
+    except Exception as e:
+
+        return f"Unexpected weather error: {str(e)}"
 
 
 # ============================================================
-# LANGCHAIN AGENT
+# 3. TOOLS LIST
 # ============================================================
 
 tools = [
@@ -111,72 +158,131 @@ tools = [
     change_to_f
 ]
 
-llm = ChatGoogleGenerativeAI(
+
+# ============================================================
+# 4. INITIALIZE GEMINI / LANGCHAIN AGENT
+# ============================================================
+
+llm_flash = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
-    google_api_key=API_KEY,
+    google_api_key=GOOGLE_API_KEY,
     temperature=0
 )
 
+
 agent = create_agent(
-    model=llm,
+    model=llm_flash,
     tools=tools,
     system_prompt=(
-        "You are restricted to Indian weather and Indian cinema. "
-        "For anything outside these topics, respond exactly: "
-        "'I am not authorized to answer questions outside of Indian "
-        "weather and cinema.'"
+        "You are a specialized AI agent restricted ONLY to "
+        "Indian weather and Indian cinema.\n\n"
+
+        "You are authorized to answer questions about:\n"
+        "1. Weather in Indian cities.\n"
+        "2. Indian movies.\n"
+        "3. Indian cinema.\n"
+        "4. Celsius to Fahrenheit conversion when it is "
+        "related to weather.\n\n"
+
+        "For any other topic, question, role, or general "
+        "knowledge outside Indian weather and cinema, "
+        "you must say exactly:\n\n"
+
+        "I am not authorized to answer questions outside "
+        "of Indian weather and cinema."
     )
 )
 
 
 # ============================================================
-# LANGSERVE
+# 5. LANGSERVE INPUT MODEL
 # ============================================================
 
 class AgentInput(BaseModel):
     input: str = Field(
-        description="Message for the agent"
+        description="Message to send to the movie and weather agent."
     )
 
 
-def format_input(x):
+# ============================================================
+# 6. FORMAT INPUT FOR AGENT
+# ============================================================
+
+def format_for_agent(x):
+
+    if isinstance(x, dict):
+        user_input = x["input"]
+
+    else:
+        user_input = x.input
 
     return {
         "messages": [
             {
                 "role": "user",
-                "content": x["input"]
+                "content": user_input
             }
         ]
     }
 
 
-def extract_response(result):
+# ============================================================
+# 7. EXTRACT FINAL AGENT RESPONSE
+# ============================================================
 
-    if isinstance(result, dict):
+def extract_text_response(agent_output):
 
-        messages = result.get("messages")
+    if not isinstance(agent_output, dict):
+        return str(agent_output)
 
-        if messages:
+    messages = agent_output.get("messages")
 
-            last = messages[-1]
+    if messages:
 
-            content = getattr(
-                last,
-                "content",
-                None
-            )
+        last_message = messages[-1]
 
-            if content is not None:
-                return str(content)
+        content = getattr(
+            last_message,
+            "content",
+            None
+        )
 
-    return str(result)
+        if content is not None:
+
+            # Gemini content can sometimes be a list
+            if isinstance(content, list):
+
+                text_parts = []
+
+                for item in content:
+
+                    if isinstance(item, dict):
+
+                        text_parts.append(
+                            item.get("text", "")
+                        )
+
+                    else:
+
+                        text_parts.append(
+                            str(item)
+                        )
+
+                return "\n".join(text_parts)
+
+            return str(content)
+
+    return str(agent_output)
 
 
-agent_chain = (
-    RunnableLambda(format_input)
+# ============================================================
+# 8. CREATE LANGCHAIN CHAIN
+# ============================================================
+
+formatted_agent_chain = (
+    RunnableLambda(format_for_agent)
     | agent
-    | RunnableLambda(extract_response)
+    | RunnableLambda(extract_text_response)
 ).with_types(
     input_type=AgentInput,
     output_type=str
@@ -184,24 +290,39 @@ agent_chain = (
 
 
 # ============================================================
-# FASTAPI
+# 9. FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
-    title="LangChain + LangGraph AI",
-    version="1.0"
+    title="Indian Movie & Weather AI",
+    version="1.0.0",
+    description=(
+        "LangChain + LangGraph application for "
+        "Indian weather, Indian cinema and "
+        "Python coding workflows."
+    )
 )
 
+
+# ============================================================
+# 10. ROOT ENDPOINT
+# ============================================================
 
 @app.get("/")
 def root():
 
     return {
         "status": "running",
+        "application": "Indian Movie & Weather AI",
         "langchain": "/agent/playground/",
-        "langgraph": "/langgraph"
+        "langgraph": "/langgraph",
+        "documentation": "/docs"
     }
 
+
+# ============================================================
+# 11. HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health():
@@ -211,44 +332,107 @@ def health():
     }
 
 
-# LangServe
+# ============================================================
+# 12. LANGSERVE ROUTE
+# ============================================================
+
 add_routes(
     app,
-    agent_chain,
+    formatted_agent_chain,
     path="/agent"
 )
 
 
 # ============================================================
-# LANGGRAPH ENDPOINT
+# 13. LANGGRAPH REQUEST MODEL
 # ============================================================
 
 class LangGraphRequest(BaseModel):
-    task: str
 
-
-@app.post("/langgraph")
-def langgraph_endpoint(request: LangGraphRequest):
-
-    result = run_langgraph(
-        request.task
+    task: str = Field(
+        description="Python coding task for the LangGraph workflow."
     )
 
+
+# ============================================================
+# 14. LANGGRAPH GET ENDPOINT
+# ============================================================
+
+@app.get("/langgraph")
+def langgraph_info():
+
     return {
-        "result": result
+        "status": "available",
+        "message": (
+            "LangGraph endpoint is available. "
+            "Use POST /langgraph to execute a task."
+        ),
+        "method": "POST",
+        "example": {
+            "task": (
+                "Write a Python program to "
+                "calculate factorial"
+            )
+        }
     }
 
 
 # ============================================================
-# RENDER ENTRY POINT
+# 15. LANGGRAPH POST ENDPOINT
+# ============================================================
+
+@app.post("/langgraph")
+def langgraph_endpoint(
+    request: LangGraphRequest
+):
+
+    try:
+
+        print(
+            f"[LangGraph] Received task: {request.task}"
+        )
+
+        result = run_langgraph(
+            request.task
+        )
+
+        print(
+            "[LangGraph] Execution completed."
+        )
+
+        return {
+            "success": True,
+            "task": request.task,
+            "result": result
+        }
+
+    except Exception as e:
+
+        print(
+            f"[LangGraph] ERROR: {str(e)}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# ============================================================
+# 16. LOCAL SERVER
 # ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
+    port = int(
+        os.environ.get("PORT", 8000)
+    )
+
     uvicorn.run(
         "langchain_app:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000))
+        port=port,
+        reload=False
     )
